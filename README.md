@@ -1,5 +1,7 @@
 # Rain World Ecosystem
 
+![demo](demo.webp)
+
 A browser-based creature ecosystem simulation inspired by Rain World. Features autonomous creatures with perception, decision-making, and survival behaviors running on a procedurally generated terrain.
 
 ## Quick Start
