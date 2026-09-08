@@ -1,0 +1,994 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Rain World Ecosystem</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body { background: #050908; overflow: hidden; color:#d9f5df; }
+  canvas { display: block; cursor: crosshair; }
+  #hud {
+    position: fixed; top: 10px; left: 10px; color: #8f8;
+    font: 12px monospace; pointer-events: none; z-index: 10;
+    text-shadow: 1px 1px 2px #000; line-height: 1.5;
+  }
+  #help {
+    position: fixed; bottom: 10px; left: 10px; color: #888;
+    font: 11px monospace; z-index: 10;
+  }
+  #help span { cursor: pointer; margin-right: 14px; user-select: none; }
+  #help span:hover { color: #fff; }
+  #panel { position:fixed; top:16px; right:16px; width:220px; padding:12px 14px;
+    color:#b9dcb9; background:rgba(5,12,10,.78); border:1px solid #38583d;
+    font:11px monospace; line-height:1.55; pointer-events:none; }
+  #panel .title { color:#e8ffe8; font-weight:bold; margin-bottom:4px; }
+  #inspector { position:fixed; bottom:16px; right:16px; width:300px; max-height:310px;
+    overflow:auto; padding:14px; color:#c9e8d0; background:rgba(7,16,13,.92);
+    border:1px solid #52785a; box-shadow:0 8px 30px #0008; font:11px monospace; }
+  #inspector.hidden { display:none; }
+  .section { color:#84d891; letter-spacing:.08em; text-transform:uppercase; margin:8px 0 5px; }
+  .meter { height:5px; background:#17251b; margin:3px 0 7px; }
+  .meter i { display:block; height:100%; background:linear-gradient(90deg,#48c878,#d7e86e); }
+  .weight { display:flex; align-items:center; gap:5px; margin:3px 0; }
+  .weight b { width:70px; font-weight:normal; }
+  .weight i { height:4px; background:#6fd68b; display:block; }
+  .badge { color:#111; background:#9fe5a8; padding:2px 5px; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<div id="hud"></div>
+<div id="panel"><div class="title">ECOSYSTEM MONITOR</div><div id="stats">Starting brain...</div></div>
+<div id="inspector" class="hidden"></div>
+<div id="help">
+  <span onclick="W.debug=!W.debug">[D]ebug</span>
+  <span onclick="W.paused=!W.paused">[P]ause</span>
+  <span onclick="W.speed=W.speed>=4?1:W.speed*2;this.textContent='[S]peed '+W.speed+'x'">[S]peed 1x</span>
+  <span onclick="W.follow=!W.follow">[C]amera Follow</span>
+  <span>WASD move</span>
+</div>
+<script>
+"use strict";
+
+// ─── CONFIG ────────────────────────────────────────────────────────────────
+const C = {
+  W: 3000, H: 2000,           // world size
+  TILE: 64,                    // tile size
+  TICK: 20,                    // sim ticks/sec
+  DAY_MS: 60000,               // ms per full day
+  NIGHT_START: 0.7,
+  NIGHT_END: 0.15,
+  ACTIVE_R: 1200,              // full sim radius from player
+  MAX_POP: 70,
+  SPAWN_CHANCE: 0.03
+};
+
+// ─── UTILS ─────────────────────────────────────────────────────────────────
+const rand = (a,b) => a + Math.random() * (b - a);
+const clamp = (v,lo,hi) => v < lo ? lo : v > hi ? hi : v;
+const dist2 = (a,b) => (a.x-b.x)**2 + (a.y-b.y)**2;
+const dist = (a,b) => Math.sqrt(dist2(a,b));
+let _uid = 0;
+const uid = () => 'c' + (_uid++);
+
+// ─── SPECIES ───────────────────────────────────────────────────────────────
+const SP = {
+  lizard_pink: {
+    id:'lizard_pink', name:'Pink Lizard', col:'#e87', size:3, speed:1.8,
+    vision:350, visionAngle:100, hearing:200, metabolism:0.3,
+    diet:['worm','small_insect'], territorial:true, denSeek:true,
+    group:'pack', maxPack:5,
+    rel:{ vulture:'afraid', worm:'eats', small_insect:'eats', lizard_pink:'ignores',
+          lizard_green:'rivals', scavenger:'ignores' },
+    pers:{ aggression:[0.3,0.8], boldness:[0.2,0.6], curiosity:[0.1,0.4] }
+  },
+  lizard_green: {
+    id:'lizard_green', name:'Green Lizard', col:'#7c7', size:4, speed:1.4,
+    vision:300, visionAngle:110, hearing:180, metabolism:0.35,
+    diet:['worm','small_insect','lizard_pink'], territorial:true, denSeek:true,
+    group:'solitary',
+    rel:{ vulture:'afraid', worm:'eats', small_insect:'eats', lizard_pink:'eats',
+          lizard_green:'ignores', scavenger:'ignores' },
+    pers:{ aggression:[0.5,0.9], boldness:[0.3,0.7], curiosity:[0.0,0.3] }
+  },
+  vulture: {
+    id:'vulture', name:'Vulture', col:'#a6a', size:5, speed:2.4,
+    vision:500, visionAngle:140, hearing:150, metabolism:0.5,
+    diet:['lizard_pink','lizard_green','worm','scavenger'],
+    territorial:false, denSeek:false, group:'none',
+    rel:{ vulture:'ignores', worm:'eats', small_insect:'eats', lizard_pink:'eats',
+          lizard_green:'eats', scavenger:'eats' },
+    pers:{ aggression:[0.6,0.95], boldness:[0.5,0.9], curiosity:[0.2,0.6] }
+  },
+  worm: {
+    id:'worm', name:'Worm', col:'#da8', size:0.5, speed:0.6,
+    vision:80, visionAngle:360, hearing:60, metabolism:0.15,
+    diet:[], territorial:false, denSeek:false, group:'none',
+    rel:{ vulture:'afraid', worm:'ignores', small_insect:'ignores',
+          lizard_pink:'afraid', lizard_green:'afraid', scavenger:'ignores' },
+    pers:{ aggression:[0,0.1], boldness:[0,0.3], curiosity:[0,0.2] }
+  },
+  small_insect: {
+    id:'small_insect', name:'Insect', col:'#aa5', size:0.3, speed:1.0,
+    vision:60, visionAngle:360, hearing:40, metabolism:0.1,
+    diet:[], territorial:false, denSeek:false, group:'none',
+    rel:{ vulture:'afraid', worm:'ignores', small_insect:'ignores',
+          lizard_pink:'afraid', lizard_green:'afraid', scavenger:'ignores' },
+    pers:{ aggression:[0,0.05], boldness:[0,0.2], curiosity:[0.1,0.4] }
+  },
+  scavenger: {
+    id:'scavenger', name:'Scavenger', col:'#88c', size:2.5, speed:1.5,
+    vision:300, visionAngle:120, hearing:250, metabolism:0.25,
+    diet:['worm','small_insect'], territorial:false, denSeek:true,
+    group:'pack', maxPack:4,
+    rel:{ vulture:'afraid', worm:'eats', small_insect:'eats',
+          lizard_pink:'afraid', lizard_green:'afraid', scavenger:'ignores' },
+    pers:{ aggression:[0.1,0.4], boldness:[0.2,0.5], curiosity:[0.4,0.8] }
+  }
+};
+
+// ─── TERRAIN ───────────────────────────────────────────────────────────────
+class Terrain {
+  constructor() {
+    const cols = Math.ceil(C.W / C.TILE);
+    const rows = Math.ceil(C.H / C.TILE);
+    this.cols = cols; this.rows = rows;
+    // value noise
+    const size = (cols + 1) * (rows + 1);
+    let n = Array.from({length: size}, () => Math.random());
+    for (let i = 0; i < 4; i++) {
+      const next = n.slice();
+      for (let r = 0; r < rows; r++)
+        for (let c = 0; c < cols; c++) {
+          let s = 0, cnt = 0;
+          for (let dr = -1; dr <= 1; dr++)
+            for (let dc = -1; dc <= 1; dc++) {
+              const nr = r+dr, nc = c+dc;
+              if (nr >= 0 && nr <= rows && nc >= 0 && nc <= cols) {
+                s += n[nr*(cols+1)+nc]; cnt++;
+              }
+            }
+          next[r*(cols+1)+c] = s/cnt;
+        }
+      n = next;
+    }
+    // classify: 0=open, 1=wall, 2=water
+    this.g = [];
+    for (let r = 0; r < rows; r++) {
+      this.g[r] = [];
+      for (let c = 0; c < cols; c++) {
+        const v = n[r*(cols+1)+c];
+        this.g[r][c] = v < 0.28 ? 1 : v < 0.38 ? 2 : 0;
+      }
+    }
+    // dens
+    this.dens = [];
+    for (let i = 0; i < 10; i++) {
+      for (let att = 0; att < 200; att++) {
+        const c = 2 + Math.floor(Math.random()*(cols-4));
+        const r = 2 + Math.floor(Math.random()*(rows-4));
+        if (this.g[r][c] === 0) {
+          let ok = true;
+          for (let dr = -1; dr <= 1 && ok; dr++)
+            for (let dc = -1; dc <= 1 && ok; dc++)
+              if (this.g[r+dr]?.[c+dc] !== 0) ok = false;
+          if (ok) {
+            this.g[r][c] = 0;
+            this.dens.push({ id:'den'+i, x:(c+0.5)*C.TILE, y:(r+0.5)*C.TILE, cap:3+Math.floor(Math.random()*3), occ:[] });
+            break;
+          }
+        }
+      }
+    }
+  }
+  tileAt(x,y) {
+    const c = Math.floor(x/C.TILE), r = Math.floor(y/C.TILE);
+    if (r < 0 || r >= this.rows || c < 0 || c >= this.cols) return 1;
+    return this.g[r][c];
+  }
+  blocked(x,y) { return this.tileAt(x,y) === 1; }
+  speedMul(x,y) { const t = this.tileAt(x,y); return t === 2 ? 0.5 : 1.0; }
+  los(x1,y1,x2,y2) {
+    const dx = x2-x1, dy = y2-y1;
+    const steps = Math.ceil(Math.max(Math.abs(dx),Math.abs(dy)) / (C.TILE*0.4));
+    for (let i = 0; i <= steps; i++) {
+      const t = steps ? i/steps : 0;
+      if (this.blocked(x1+dx*t, y1+dy*t)) return false;
+    }
+    return true;
+  }
+}
+
+// ─── QUADTREE ──────────────────────────────────────────────────────────────
+class QT {
+  constructor(x,y,w,h,cap=8) {
+    this.x=x; this.y=y; this.w=w; this.h=h; this.cap=cap;
+    this.items=[]; this.sub=false;
+  }
+  contains(px,py) { return px>=this.x && px<this.x+this.w && py>=this.y && py<this.y+this.h; }
+  intersects(rx,ry,rw,rh) { return !(rx>this.x+this.w||rx+rw<this.x||ry>this.y+this.h||ry+rh<this.y); }
+  split() {
+    const hw=this.w/2, hh=this.h/2, x=this.x, y=this.y;
+    this.nw=new QT(x,y,hw,hh,this.cap);
+    this.ne=new QT(x+hw,y,hw,hh,this.cap);
+    this.sw=new QT(x,y+hh,hw,hh,this.cap);
+    this.se=new QT(x+hw,y+hh,hw,hh,this.cap);
+    this.sub=true;
+  }
+  insert(item) {
+    if (!this.contains(item.x,item.y)) return;
+    if (this.items.length < this.cap && !this.sub) { this.items.push(item); return; }
+    if (!this.sub) this.split();
+    this.nw.insert(item); this.ne.insert(item); this.sw.insert(item); this.se.insert(item);
+  }
+  query(rx,ry,rw,rh,out=[]) {
+    if (!this.intersects(rx,ry,rw,rh)) return out;
+    for (const it of this.items)
+      if (it.x>=rx && it.x<rx+rw && it.y>=ry && it.y<ry+rh) out.push(it);
+    if (this.sub) {
+      this.nw.query(rx,ry,rw,rh,out);
+      this.ne.query(rx,ry,rw,rh,out);
+      this.sw.query(rx,ry,rw,rh,out);
+      this.se.query(rx,ry,rw,rh,out);
+    }
+    return out;
+  }
+}
+
+// ─── CREATURE ──────────────────────────────────────────────────────────────
+function makeCreature(spId, x, y) {
+  const sp = SP[spId];
+  // The player is rendered and controlled separately from ecosystem species.
+  // Keep a compatible personality shape so the shared creature state can be
+  // initialized without trying to read SP['_player'], which does not exist.
+  const p = sp?.pers || {
+    aggression: [0, 0],
+    boldness: [0, 0],
+    curiosity: [0, 0]
+  };
+  return {
+    id: uid(), sp: spId, x, y, vx:0, vy:0,
+    facing: Math.random()*Math.PI*2,
+    hunger: rand(0.1,0.5), health:1, fatigue:0,
+    homeDen: null, behavior:'idle', bTimer:0,
+    pers: {
+      aggr: rand(p.aggression[0],p.aggression[1]),
+      bold: rand(p.boldness[0],p.boldness[1]),
+      curi: rand(p.curiosity[0],p.curiosity[1])
+    },
+    brain: makeBrain(),
+    rels: {},  // { targetId: { type, intensity, lastX, lastY, lastTick } }
+    abs: false, age:0, noise:0, atkCD:0, tgt:null
+  };
+}
+
+// ─── WORLD STATE ───────────────────────────────────────────────────────────
+const W = {
+  terrain: new Terrain(),
+  creatures: [],
+  player: null,
+  tick: 0,
+  dayTime: 0,
+  cam: {x:0, y:0},
+  debug: true,
+  paused: false,
+  speed: 1,
+  follow: true,
+  accumulator: 0,
+  qt: null
+};
+let selectedCreature = null;
+
+// ─── SPAWN ─────────────────────────────────────────────────────────────────
+function spawnRandom(spId) {
+  for (let i = 0; i < 80; i++) {
+    const x = rand(40, C.W-40), y = rand(40, C.H-40);
+    if (!W.terrain.blocked(x,y)) {
+      const c = makeCreature(spId, x, y);
+      const den = nearestDen(c);
+      if (den) c.homeDen = den.id;
+      W.creatures.push(c);
+      return c;
+    }
+  }
+  return null;
+}
+
+function nearestDen(c) {
+  let best = null, bd = Infinity;
+  for (const d of W.terrain.dens) {
+    const dd = dist(c, d);
+    if (dd < bd) { bd = dd; best = d; }
+  }
+  return best;
+}
+
+function initWorld() {
+  W.player = makeCreature('_player', C.W/2, C.H/2);
+  W.player.sp = '_player';
+  W.creatures.push(W.player);
+  const spawns = [
+    ['lizard_pink',6], ['lizard_green',3], ['vulture',2],
+    ['worm',15], ['small_insect',20], ['scavenger',4]
+  ];
+  for (const [sp,n] of spawns) for (let i = 0; i < n; i++) spawnRandom(sp);
+}
+
+// ─── PERCEPTION ────────────────────────────────────────────────────────────
+function perceive(cr) {
+  const sp = SP[cr.sp];
+  if (!sp) return { prey:[], threats:[], rivals:[], neutrals:[] };
+  const r = Math.max(sp.vision, sp.hearing);
+  const nearby = W.qt ? W.qt.query(cr.x-r, cr.y-r, r*2, r*2) : [];
+  const seen = { prey:[], threats:[], rivals:[], neutrals:[] };
+
+  for (const o of nearby) {
+    if (o.id === cr.id) continue;
+    const osp = SP[o.sp];
+    if (!osp) continue;
+    const d = dist(cr, o);
+    if (d > r) continue;
+
+    // vision
+    let visConf = 0;
+    if (d <= sp.vision) {
+      const ang = Math.atan2(o.y-cr.y, o.x-cr.x);
+      let diff = Math.abs(ang - cr.facing);
+      if (diff > Math.PI) diff = 2*Math.PI - diff;
+      if (diff <= sp.visionAngle * Math.PI / 360) {
+        if (W.terrain.los(cr.x,cr.y,o.x,o.y)) {
+          visConf = 1.0 - (d / sp.vision) * 0.5;
+        }
+      }
+    }
+    // hearing
+    let hearConf = 0;
+    if (d <= sp.hearing && o.noise > 0.1) {
+      hearConf = o.noise * (1 - d/sp.hearing*0.7);
+      if (!W.terrain.los(cr.x,cr.y,o.x,o.y)) hearConf *= 0.3;
+    }
+    const conf = Math.max(visConf, hearConf);
+    if (conf < 0.1) continue;
+
+    const relType = sp.rel[o.sp] || 'ignores';
+    const intensity = conf * clamp(100/d, 0, 2);
+
+    // update dynamic rel
+    if (!cr.rels[o.id]) {
+      cr.rels[o.id] = { type:relType, intensity, lastX:o.x, lastY:o.y, lastTick:W.tick };
+    } else {
+      const r = cr.rels[o.id];
+      r.type = relType;
+      r.intensity = lerp(r.intensity, intensity, 0.3);
+      r.lastX = o.x; r.lastY = o.y; r.lastTick = W.tick;
+    }
+
+    const entry = { cr:o, conf, d, rel:relType };
+    if (relType === 'eats' || relType === 'attacks') seen.prey.push(entry);
+    else if (relType === 'afraid') seen.threats.push(entry);
+    else if (relType === 'rivals') seen.rivals.push(entry);
+    else seen.neutrals.push(entry);
+  }
+
+  // decay old rels
+  for (const [tid, r] of Object.entries(cr.rels)) {
+    if (W.tick - r.lastTick > 200) {
+      r.intensity *= 0.99;
+      if (r.intensity < 0.05) delete cr.rels[tid];
+    }
+  }
+  return seen;
+}
+
+function lerp(a,b,t) { return a+(b-a)*t; }
+
+// Lightweight per-creature neural controller: seven sensory inputs produce
+// one preference score for each possible action.
+const ACTIONS = ['hunt','flee','forage','rest','den','territory','social','curiosity'];
+function makeBrain() {
+  return ACTIONS.map(() => Array.from({length: 8}, () => rand(-1, 1)));
+}
+function brainThink(cr, features) {
+  return cr.brain.map(weights => Math.tanh(
+    weights[0] + features.reduce((sum, value, i) => sum + weights[i + 1] * value, 0)
+  ));
+}
+
+// ─── UTILITY AI ────────────────────────────────────────────────────────────
+function countAllies(cr) {
+  if (!W.qt) return 0;
+  const nearby = W.qt.query(cr.x-300, cr.y-300, 600, 600);
+  let n = 0;
+  for (const o of nearby) if (o.id !== cr.id && o.sp === cr.sp) n++;
+  return n;
+}
+
+function utilityScores(cr, perc) {
+  const sp = SP[cr.sp];
+  const sc = {};
+
+  let maxThreat = 0, minTD = Infinity;
+  for (const t of perc.threats) {
+    if (t.conf > maxThreat) maxThreat = t.conf;
+    if (t.d < minTD) minTD = t.d;
+  }
+
+  const allies = countAllies(cr);
+  const packF = sp.group === 'pack' ? Math.max(0.2, 1 - allies*0.15) : 1;
+
+  // hunt
+  if (perc.prey.length > 0 && sp.diet.length > 0) {
+    const cp = perc.prey.reduce((a,b) => a.d < b.d ? a : b);
+    const prox = 1 - clamp(cp.d / sp.vision, 0, 1);
+    sc.hunt = cr.hunger * prox * (1 - maxThreat*packF) * (1 + cr.pers.aggr*0.5) * (allies > 0 ? 1.3 : 1);
+  } else sc.hunt = 0;
+
+  // flee
+  if (perc.threats.length > 0) {
+    const tu = maxThreat * (minTD < 200 ? 2 : 100/minTD);
+    sc.flee = tu * packF * (1 - cr.pers.bold*0.6);
+  } else sc.flee = 0;
+
+  // forage
+  sc.forage = cr.hunger * 0.5 * (perc.prey.length > 0 ? 0.5 : 1);
+
+  // rest
+  sc.rest = cr.fatigue * 0.6 * (1 - cr.hunger*0.3);
+
+  // den
+  sc.den = sp.denSeek ? (isNightDanger() ? 0.8 : 0) + cr.fatigue*0.2 : 0;
+
+  // territory
+  sc.territory = (sp.territorial && perc.rivals.length > 0)
+    ? cr.pers.aggr * 0.6 * (1 - maxThreat*packF) : 0;
+
+  // social
+  if (sp.group === 'pack') {
+    const deficit = Math.max(0, 1 - allies/(sp.maxPack||4));
+    sc.social = deficit * 0.3;
+  } else sc.social = 0;
+
+  // curiosity
+  sc.curiosity = perc.neutrals.length > 0 ? cr.pers.curi * 0.3 : 0;
+
+  const features = [
+    cr.hunger, cr.fatigue, maxThreat,
+    perc.prey.length ? 1 : 0, perc.threats.length ? 1 : 0,
+    clamp(allies / 5, 0, 1), isNightDanger() ? 1 : 0
+  ];
+  const neural = brainThink(cr, features);
+  ACTIONS.forEach((action, i) => { sc[action] = (sc[action] || 0) + neural[i] * 0.6; });
+  return sc;
+}
+
+function pickBehavior(sc) {
+  let best = 'idle', bs = 0;
+  for (const [k,v] of Object.entries(sc)) if (v > bs) { bs = v; best = k; }
+  return best;
+}
+
+// ─── STEERING ──────────────────────────────────────────────────────────────
+function seek(cr, tx, ty) {
+  const dx = tx-cr.x, dy = ty-cr.y, d = Math.hypot(dx,dy);
+  if (d < 3) { cr.vx = 0; cr.vy = 0; return; }
+  const spd = SP[cr.sp].speed * W.terrain.speedMul(cr.x,cr.y);
+  cr.vx = dx/d * spd;
+  cr.vy = dy/d * spd;
+  cr.facing = Math.atan2(dy,dx);
+}
+
+function flee(cr, tx, ty) {
+  const dx = cr.x-tx, dy = cr.y-ty, d = Math.hypot(dx,dy);
+  if (d < 1) return;
+  const spd = SP[cr.sp].speed * 1.3 * W.terrain.speedMul(cr.x,cr.y);
+  cr.vx = dx/d * spd;
+  cr.vy = dy/d * spd;
+  cr.facing = Math.atan2(dy,dx);
+}
+
+function wander(cr) {
+  cr.facing += rand(-0.4, 0.4);
+  const spd = SP[cr.sp].speed * 0.6 * W.terrain.speedMul(cr.x,cr.y);
+  cr.vx = Math.cos(cr.facing) * spd;
+  cr.vy = Math.sin(cr.facing) * spd;
+}
+
+function applyMove(cr) {
+  const nx = cr.x + cr.vx, ny = cr.y + cr.vy;
+  if (!W.terrain.blocked(nx, cr.y)) cr.x = nx; else { cr.vx *= -0.5; cr.facing += rand(-0.5,0.5); }
+  if (!W.terrain.blocked(cr.x, ny)) cr.y = ny; else { cr.vy *= -0.5; cr.facing += rand(-0.5,0.5); }
+  cr.x = clamp(cr.x, 5, C.W-5);
+  cr.y = clamp(cr.y, 5, C.H-5);
+}
+
+// ─── BEHAVIOR EXECUTION ────────────────────────────────────────────────────
+function execBehavior(cr, perc, sc) {
+  const b = pickBehavior(sc);
+  cr.behavior = b;
+  cr.bTimer++;
+
+  switch (b) {
+    case 'hunt': {
+      const cp = perc.prey.length > 0 ? perc.prey.reduce((a,c) => a.d < c.d ? a : c) : null;
+      if (cp) {
+        seek(cr, cp.cr.x, cp.cr.y);
+        cr.noise = 0.6;
+        if (cp.d < 18 && cr.atkCD <= 0) {
+          cp.cr.health -= 0.3 * cr.pers.aggr;
+          cr.atkCD = 15; cr.noise = 0.9;
+        }
+      } else { wander(cr); cr.noise = 0.3; }
+      break;
+    }
+    case 'flee': {
+      const ct = perc.threats.length > 0 ? perc.threats.reduce((a,c) => a.d < c.d ? a : c) : null;
+      if (ct) { flee(cr, ct.cr.x, ct.cr.y); cr.noise = 0.8; }
+      else { wander(cr); cr.noise = 0.3; }
+      break;
+    }
+    case 'forage': {
+      const food = perc.prey.filter(p => p.d < 200);
+      if (food.length > 0) {
+        const f = food.reduce((a,c) => a.d < c.d ? a : c);
+        seek(cr, f.cr.x, f.cr.y);
+      } else {
+        if (!cr.tgt || cr.bTimer % 60 === 0)
+          cr.tgt = { x: clamp(cr.x+rand(-300,300),20,C.W-20), y: clamp(cr.y+rand(-300,300),20,C.H-20) };
+        seek(cr, cr.tgt.x, cr.tgt.y);
+      }
+      cr.noise = 0.2;
+      cr.hunger = clamp(cr.hunger - 0.001, 0, 1);
+      break;
+    }
+    case 'rest': {
+      cr.vx *= 0.8; cr.vy *= 0.8;
+      cr.fatigue = clamp(cr.fatigue - 0.005, 0, 1);
+      cr.noise = 0.05;
+      break;
+    }
+    case 'den': {
+      const den = nearestDen(cr);
+      if (den) {
+        seek(cr, den.x, den.y);
+        if (dist(cr, den) < 40) { cr.fatigue = clamp(cr.fatigue - 0.01, 0, 1); cr.noise = 0.05; }
+      } else { cr.vx *= 0.5; cr.vy *= 0.5; }
+      cr.noise = 0.1;
+      break;
+    }
+    case 'territory': {
+      if (perc.rivals.length > 0) {
+        const rv = perc.rivals.reduce((a,c) => a.d < c.d ? a : c);
+        seek(cr, rv.cr.x, rv.cr.y);
+        if (rv.d < 30 && cr.atkCD <= 0) { rv.cr.health -= 0.15; cr.atkCD = 20; cr.noise = 0.9; }
+      } else {
+        if (!cr.tgt || cr.bTimer % 120 === 0)
+          cr.tgt = { x: clamp(cr.x+rand(-200,200),20,C.W-20), y: clamp(cr.y+rand(-200,200),20,C.H-20) };
+        seek(cr, cr.tgt.x, cr.tgt.y);
+      }
+      cr.noise = 0.4;
+      break;
+    }
+    case 'social': {
+      if (W.qt) {
+        const near = W.qt.query(cr.x-400, cr.y-400, 800, 800);
+        let best = null, bd = Infinity;
+        for (const o of near) {
+          if (o.id !== cr.id && o.sp === cr.sp) {
+            const dd = dist(cr, o);
+            if (dd < bd) { bd = dd; best = o; }
+          }
+        }
+        if (best && bd > 100) seek(cr, best.x, best.y);
+        else wander(cr);
+      } else wander(cr);
+      cr.noise = 0.15;
+      break;
+    }
+    case 'curiosity': {
+      if (perc.neutrals.length > 0) {
+        const t = perc.neutrals[0];
+        seek(cr, t.cr.x, t.cr.y);
+      } else wander(cr);
+      cr.noise = 0.2;
+      break;
+    }
+    default: wander(cr); cr.noise = 0.1; break;
+  }
+}
+
+// ─── SIMULATION ────────────────────────────────────────────────────────────
+function isNightDanger() {
+  const f = (W.dayTime % C.DAY_MS) / C.DAY_MS;
+  return f > C.NIGHT_START || f < C.NIGHT_END;
+}
+
+function dayPhase() {
+  const f = (W.dayTime % C.DAY_MS) / C.DAY_MS;
+  if (f < 0.15) return 'dawn';
+  if (f < 0.5) return 'day';
+  if (f < 0.7) return 'dusk';
+  return 'night';
+}
+
+function dayBright() {
+  const f = (W.dayTime % C.DAY_MS) / C.DAY_MS;
+  if (f > 0.7 || f < 0.15) return 0.3;
+  if (f > 0.6) return lerp(1, 0.3, (f-0.6)/0.1);
+  if (f < 0.2) return lerp(0.3, 1, f/0.2);
+  return 1;
+}
+
+function simStep() {
+  // build quadtree
+  W.qt = new QT(0, 0, C.W, C.H);
+  for (const c of W.creatures) W.qt.insert(c);
+
+  for (const cr of W.creatures) {
+    if (cr.sp === '_player') continue;
+    const d = dist(cr, W.player);
+
+    // abstract/promote
+    if (d < C.ACTIVE_R && cr.abs) cr.abs = false;
+    else if (d >= C.ACTIVE_R && !cr.abs) cr.abs = true;
+
+    if (cr.abs) {
+      // abstract tick
+      cr.hunger = clamp(cr.hunger + SP[cr.sp].metabolism * 0.01, 0, 1);
+      cr.fatigue = clamp(cr.fatigue + 0.002, 0, 1);
+      cr.age++;
+      if (cr.hunger > 0.95) cr.health -= 0.01;
+      if (Math.random() < 0.3) {
+        const spd = SP[cr.sp].speed * 0.3;
+        cr.x = clamp(cr.x + rand(-spd*10, spd*10), 20, C.W-20);
+        cr.y = clamp(cr.y + rand(-spd*10, spd*10), 20, C.H-20);
+      }
+      // abstract encounters
+      if (Math.random() < 0.01) {
+        for (const o of W.creatures) {
+          if (o.id === cr.id || o.sp === '_player') continue;
+          if (dist(cr, o) < 150) {
+            const rt = SP[cr.sp].rel[o.sp] || 'ignores';
+            if (rt === 'eats' && Math.random() < 0.3) {
+              o.health -= 0.2;
+              cr.hunger = clamp(cr.hunger - 0.2, 0, 1);
+            }
+          }
+        }
+      }
+      continue;
+    }
+
+    // FULL TICK
+    cr.hunger = clamp(cr.hunger + SP[cr.sp].metabolism * 0.005, 0, 1);
+    cr.fatigue = clamp(cr.fatigue + 0.0005, 0, 1);
+    cr.age++;
+    if (cr.atkCD > 0) cr.atkCD--;
+    if (cr.hunger > 0.9) cr.health -= 0.002;
+
+    const perc = perceive(cr);
+    const sc = utilityScores(cr, perc);
+    execBehavior(cr, perc, sc);
+    applyMove(cr);
+
+    // eating
+    if (cr.behavior === 'hunt') {
+      for (const p of perc.prey) {
+        if (p.d < 15) {
+          p.cr.health -= 0.5;
+          cr.hunger = clamp(cr.hunger - 0.3, 0, 1);
+        }
+      }
+    }
+  }
+
+  // remove dead
+  W.creatures = W.creatures.filter(c => c.health > 0 || c.sp === '_player');
+
+  // population regen
+  const counts = {};
+  for (const c of W.creatures) {
+    if (c.sp !== '_player') counts[c.sp] = (counts[c.sp]||0) + 1;
+  }
+  for (const [sp, cnt] of Object.entries(counts)) {
+    const target = sp === 'worm' ? 15 : sp === 'small_insect' ? 20 : 5;
+    if (cnt < target && Math.random() < C.SPAWN_CHANCE) spawnRandom(sp);
+  }
+  while (W.creatures.length > C.MAX_POP) {
+    const np = W.creatures.filter(c => c.sp !== '_player');
+    if (!np.length) break;
+    const rm = np[Math.floor(Math.random()*np.length)];
+    W.creatures.splice(W.creatures.indexOf(rm), 1);
+  }
+}
+
+// ─── INPUT ─────────────────────────────────────────────────────────────────
+const keys = {};
+let mouseX = 0, mouseY = 0;
+window.addEventListener('keydown', e => {
+  keys[e.key.toLowerCase()] = true;
+  if (e.key.toLowerCase() === 'd') W.debug = !W.debug;
+  if (e.key.toLowerCase() === 'p') W.paused = !W.paused;
+  if (e.key.toLowerCase() === 's') W.speed = W.speed >= 4 ? 1 : W.speed * 2;
+  if (e.key.toLowerCase() === 'c') W.follow = !W.follow;
+});
+window.addEventListener('keyup', e => keys[e.key.toLowerCase()] = false);
+window.addEventListener('mousemove', e => { mouseX = e.clientX; mouseY = e.clientY; });
+
+function handleInput() {
+  const p = W.player;
+  if (!p) return;
+  const spd = 4;
+  let moved = false;
+  if (keys['w'] || keys['arrowup'])    { p.y -= spd; moved = true; }
+  if (keys['s'] || keys['arrowdown'])  { p.y += spd; moved = true; }
+  if (keys['a'] || keys['arrowleft'])  { p.x -= spd; moved = true; }
+  if (keys['d'] || keys['arrowright']) { p.x += spd; moved = true; }
+  p.x = clamp(p.x, 10, C.W-10);
+  p.y = clamp(p.y, 10, C.H-10);
+  p.noise = moved ? 0.5 : 0.1;
+  // face mouse
+  const wx = mouseX + W.cam.x, wy = mouseY + W.cam.y;
+  p.facing = Math.atan2(wy-p.y, wx-p.x);
+}
+
+// ─── RENDER ────────────────────────────────────────────────────────────────
+const canvas = document.getElementById('c');
+const ctx = canvas.getContext('2d');
+canvas.addEventListener('click', e => {
+  const wx = e.clientX + W.cam.x, wy = e.clientY + W.cam.y;
+  selectedCreature = W.creatures.filter(c => c.sp !== '_player')
+    .map(c => ({c, d:Math.hypot(c.x-wx,c.y-wy)})).filter(x => x.d < 30)
+    .sort((a,b) => a.d-b.d)[0]?.c || null;
+});
+
+function resize() {
+  canvas.width = window.innerWidth;
+  canvas.height = window.innerHeight;
+}
+window.addEventListener('resize', resize);
+resize();
+
+function render() {
+  const bright = dayBright();
+  const p = W.player;
+
+  // camera
+  if (W.follow && p) {
+    W.cam.x = p.x - canvas.width/2;
+    W.cam.y = p.y - canvas.height/2;
+  }
+
+  // clear
+  ctx.fillStyle = `rgb(${12*bright|0},${12*bright|0},${20*bright|0})`;
+  ctx.fillRect(0, 0, canvas.width, canvas.height);
+
+  ctx.save();
+  ctx.translate(-W.cam.x, -W.cam.y);
+
+  // terrain
+  const t = W.terrain;
+  const sc = Math.max(0, Math.floor(W.cam.x / C.TILE));
+  const ec = Math.min(t.cols, Math.ceil((W.cam.x + canvas.width) / C.TILE) + 1);
+  const sr = Math.max(0, Math.floor(W.cam.y / C.TILE));
+  const er = Math.min(t.rows, Math.ceil((W.cam.y + canvas.height) / C.TILE) + 1);
+
+  for (let r = sr; r < er; r++) {
+    for (let c = sc; c < ec; c++) {
+      const v = t.g[r][c];
+      const x = c*C.TILE, y = r*C.TILE;
+      if (v === 0) ctx.fillStyle = `rgb(${35*bright|0},${45*bright|0},${30*bright|0})`;
+      else if (v === 1) ctx.fillStyle = `rgb(${20*bright|0},${18*bright|0},${25*bright|0})`;
+      else ctx.fillStyle = `rgb(${15*bright|0},${30*bright|0},${50*bright|0})`;
+      ctx.fillRect(x, y, C.TILE, C.TILE);
+    }
+  }
+
+  // dens
+  for (const d of t.dens) {
+    ctx.fillStyle = `rgba(80,60,40,${0.6*bright})`;
+    ctx.beginPath(); ctx.arc(d.x, d.y, 18, 0, Math.PI*2); ctx.fill();
+    ctx.fillStyle = `rgba(40,30,20,${0.8*bright})`;
+    ctx.beginPath(); ctx.arc(d.x, d.y, 12, 0, Math.PI*2); ctx.fill();
+  }
+
+  // creatures
+  for (const cr of W.creatures) {
+    if (cr.sp === '_player') continue;
+    if (cr.x < W.cam.x-60 || cr.x > W.cam.x+canvas.width+60 ||
+        cr.y < W.cam.y-60 || cr.y > W.cam.y+canvas.height+60) continue;
+
+    const sp = SP[cr.sp];
+    const sz = 4 + sp.size * 2;
+    const col = sp.col;
+    const r = parseInt(col[1],16)*17, g = parseInt(col[2],16)*17, b = parseInt(col[3],16)*17;
+    if (cr === selectedCreature) {
+      ctx.save(); ctx.strokeStyle='#e6ff9a'; ctx.lineWidth=2; ctx.shadowColor='#b7ff83'; ctx.shadowBlur=18;
+      ctx.beginPath(); ctx.arc(cr.x,cr.y,12+Math.sin(W.tick*.15)*2,0,Math.PI*2); ctx.stroke(); ctx.restore();
+    }
+
+    ctx.save();
+    ctx.translate(cr.x, cr.y);
+    ctx.rotate(cr.facing);
+    // body
+    ctx.fillStyle = `rgba(${r},${g},${b},${bright})`;
+    ctx.beginPath(); ctx.ellipse(0, 0, sz, sz*0.6, 0, 0, Math.PI*2); ctx.fill();
+    // head
+    ctx.fillStyle = `rgba(${Math.min(255,r+30)},${Math.min(255,g+30)},${Math.min(255,b+30)},${bright})`;
+    ctx.beginPath(); ctx.arc(sz*0.6, 0, sz*0.35, 0, Math.PI*2); ctx.fill();
+    // eye
+    ctx.fillStyle = `rgba(255,255,200,${bright})`;
+    ctx.beginPath(); ctx.arc(sz*0.75, -sz*0.15, 2, 0, Math.PI*2); ctx.fill();
+    // Species-specific silhouettes and markings make the ecosystem readable.
+    ctx.lineWidth = 1.5;
+    if (cr.sp.startsWith('lizard')) {
+      ctx.fillStyle = cr.sp === 'lizard_pink' ? '#ffb0bd' : '#b7ef9a';
+      ctx.beginPath(); ctx.moveTo(-sz*.7,-sz*.45); ctx.lineTo(-sz*1.8,-sz*.9); ctx.lineTo(-sz*1.4,0); ctx.lineTo(-sz*1.8,sz*.9); ctx.lineTo(-sz*.7,sz*.45); ctx.fill();
+      ctx.strokeStyle = '#263b2a'; ctx.beginPath(); ctx.moveTo(-sz*.1,-sz*.55); ctx.lineTo(sz*.1,-sz*1.05); ctx.moveTo(sz*.35,-sz*.5); ctx.lineTo(sz*.55,-sz*.9); ctx.stroke();
+    } else if (cr.sp === 'vulture') {
+      ctx.fillStyle = '#62506e'; ctx.beginPath(); ctx.ellipse(0,-sz*.75,sz*1.1,sz*.35,0,0,Math.PI*2); ctx.ellipse(0,sz*.75,sz*1.1,sz*.35,0,0,Math.PI*2); ctx.fill();
+      ctx.fillStyle = '#f4d77d'; ctx.beginPath(); ctx.moveTo(sz*1.2,0); ctx.lineTo(sz*2,sz*.25); ctx.lineTo(sz*1.2,sz*.5); ctx.fill();
+    } else if (cr.sp === 'worm') {
+      ctx.strokeStyle = '#f5c58d'; ctx.lineWidth = 2; ctx.beginPath(); ctx.moveTo(-sz*1.5,0); ctx.bezierCurveTo(-sz, -sz, sz, sz, sz*1.5,0); ctx.stroke();
+    } else if (cr.sp === 'small_insect') {
+      ctx.strokeStyle = '#ddd77d'; ctx.lineWidth = 1; ctx.beginPath(); ctx.moveTo(0,-sz*.3); ctx.lineTo(-sz*1.5,-sz*1.5); ctx.moveTo(0,sz*.3); ctx.lineTo(-sz*1.5,sz*1.5); ctx.stroke();
+      ctx.beginPath(); ctx.moveTo(sz*.5,-sz*.2); ctx.lineTo(sz*1.5,-sz*1.2); ctx.moveTo(sz*.5,sz*.2); ctx.lineTo(sz*1.5,sz*1.2); ctx.stroke();
+    } else if (cr.sp === 'scavenger') {
+      ctx.strokeStyle = '#d7b6ff'; ctx.lineWidth = 2; ctx.beginPath(); ctx.moveTo(-sz*.5,-sz*.7); ctx.lineTo(sz*.5,-sz*.7); ctx.moveTo(-sz*.5,sz*.7); ctx.lineTo(sz*.5,sz*.7); ctx.stroke();
+      ctx.fillStyle = '#e9d8ff'; ctx.fillRect(sz*.85,-sz*.12,sz*.25,sz*.24);
+    }
+    ctx.restore();
+
+    // health bar
+    if (cr.health < 0.9) {
+      ctx.fillStyle = 'rgba(0,0,0,0.5)';
+      ctx.fillRect(cr.x-10, cr.y-sz-6, 20, 3);
+      ctx.fillStyle = cr.health > 0.5 ? '#4a4' : '#a44';
+      ctx.fillRect(cr.x-10, cr.y-sz-6, 20*cr.health, 3);
+    }
+
+    // abstracted indicator
+    if (cr.abs) {
+      ctx.fillStyle = 'rgba(255,255,255,0.15)';
+      ctx.beginPath(); ctx.arc(cr.x, cr.y, sz+4, 0, Math.PI*2); ctx.stroke();
+    }
+
+    // debug
+    if (W.debug) {
+      ctx.fillStyle = 'rgba(200,200,200,0.5)';
+      ctx.font = '9px monospace';
+      ctx.textAlign = 'center';
+      ctx.fillText(cr.behavior, cr.x, cr.y - sz - 8);
+    }
+  }
+
+  // player
+  if (p) {
+    ctx.save();
+    ctx.translate(p.x, p.y);
+    ctx.rotate(p.facing);
+    ctx.fillStyle = `rgba(220,220,240,${bright})`;
+    ctx.beginPath(); ctx.ellipse(0, 0, 10, 6, 0, 0, Math.PI*2); ctx.fill();
+    ctx.fillStyle = `rgba(240,240,255,${bright})`;
+    ctx.beginPath(); ctx.arc(5, 0, 4, 0, Math.PI*2); ctx.fill();
+    ctx.fillStyle = '#333';
+    ctx.beginPath(); ctx.arc(7, -2, 1.5, 0, Math.PI*2); ctx.fill();
+    ctx.beginPath(); ctx.arc(7, 2, 1.5, 0, Math.PI*2); ctx.fill();
+    ctx.restore();
+  }
+
+  // debug overlays
+  if (W.debug) {
+    for (const cr of W.creatures) {
+      if (cr.sp === '_player') continue;
+      if (cr.x < W.cam.x-100 || cr.x > W.cam.x+canvas.width+100 ||
+          cr.y < W.cam.y-100 || cr.y > W.cam.y+canvas.height+100) continue;
+      const sp = SP[cr.sp];
+      // vision cone
+      ctx.save();
+      ctx.translate(cr.x, cr.y);
+      ctx.rotate(cr.facing);
+      ctx.fillStyle = 'rgba(100,200,100,0.05)';
+      ctx.beginPath();
+      ctx.moveTo(0,0);
+      ctx.arc(0, 0, sp.vision, -sp.visionAngle*Math.PI/360, sp.visionAngle*Math.PI/360);
+      ctx.closePath(); ctx.fill();
+      ctx.restore();
+      // hearing
+      ctx.strokeStyle = 'rgba(100,100,200,0.12)';
+      ctx.beginPath(); ctx.arc(cr.x, cr.y, sp.hearing, 0, Math.PI*2); ctx.stroke();
+      // rel lines
+      for (const [tid, rel] of Object.entries(cr.rels)) {
+        const target = W.creatures.find(c => c.id === tid);
+        if (!target) continue;
+        let col;
+        if (rel.type === 'eats' || rel.type === 'attacks') col = 'rgba(255,80,80,0.3)';
+        else if (rel.type === 'afraid') col = 'rgba(255,200,50,0.3)';
+        else if (rel.type === 'rivals') col = 'rgba(200,100,255,0.3)';
+        else col = 'rgba(150,150,150,0.15)';
+        ctx.strokeStyle = col;
+        ctx.setLineDash([3,3]);
+        ctx.beginPath(); ctx.moveTo(cr.x,cr.y); ctx.lineTo(target.x,target.y); ctx.stroke();
+        ctx.setLineDash([]);
+      }
+    }
+  }
+
+  ctx.restore();
+
+  // HUD
+  const pop = {};
+  for (const c of W.creatures) pop[c.sp] = (pop[c.sp]||0)+1;
+  const lines = [
+    `Tick:${W.tick} Phase:${dayPhase()} Pop:${W.creatures.length} Speed:${W.speed}x ${W.paused?'PAUSED':''}`,
+    ''
+  ];
+  for (const [sp,cnt] of Object.entries(pop))
+    lines.push(`  ${SP[sp]?.name||sp}: ${cnt}`);
+
+  ctx.font = '12px monospace';
+  ctx.textAlign = 'left';
+  let y = 30;
+  ctx.fillStyle = 'rgba(150,200,150,0.8)';
+  for (const l of lines) { ctx.fillText(l, 15, y); y += 16; }
+  const stats = document.getElementById('stats');
+  if (stats) {
+    const behaviorCounts = {};
+    for (const c of W.creatures) if (c.sp !== '_player')
+      behaviorCounts[c.behavior] = (behaviorCounts[c.behavior] || 0) + 1;
+    const top = Object.entries(behaviorCounts).sort((a,b) => b[1]-a[1]).slice(0,4);
+    stats.innerHTML = `Tick ${W.tick} · ${dayPhase()}<br>` +
+      `Population: ${W.creatures.length - 1}<br>` +
+      `Neural agents: ${W.creatures.length - 1}<br>` +
+      `<br><span style="color:#8fc98f">Current behaviors</span><br>` +
+      top.map(([name,count]) => `${name.padEnd(11)} ${count}`).join('<br>');
+  }
+  updateInspector();
+}
+
+function updateInspector() {
+  const box = document.getElementById('inspector');
+  if (!box) return;
+  if (!selectedCreature) { box.classList.add('hidden'); return; }
+  box.classList.remove('hidden');
+  const c = selectedCreature, sp = SP[c.sp];
+  const features = [c.hunger,c.fatigue,0,0,0,clamp(countAllies(c)/5,0,1),isNightDanger()?1:0];
+  const outputs = brainThink(c, features);
+  const names = ['hunger','fatigue','threat','food','danger','allies','night'];
+  const inputs = names.map((n,i) => `<div>${n.padEnd(8)} ${features[i].toFixed(2)}</div>`).join('');
+  const rows = ACTIONS.map((a,i) => `<div class="weight"><b>${a}</b><span class="meter" style="flex:1"><i style="width:${Math.round((outputs[i]+1)*50)}%"></i></span><span>${outputs[i].toFixed(2)}</span></div>`).join('');
+  box.innerHTML = `<div><span class="badge">${sp.name}</span> ${c.id}</div>
+    <div class="section">Current state</div>behavior: <b>${c.behavior}</b><br>health: ${Math.round(c.health*100)}% · age: ${c.age}<br>hunger: ${Math.round(c.hunger*100)}% · fatigue: ${Math.round(c.fatigue*100)}%
+    <div class="section">Brain inputs</div>${inputs}<div class="section">Neural outputs</div>${rows}
+    <div style="color:#78977e;margin-top:8px">Click another creature to inspect it.</div>`;
+}
+
+// ─── MAIN LOOP ─────────────────────────────────────────────────────────────
+initWorld();
+let lastT = performance.now();
+
+function loop(now) {
+  const dt = Math.min((now - lastT) / 1000, 0.1);
+  lastT = now;
+
+  handleInput();
+
+  if (!W.paused) {
+    W.accumulator += dt;
+    const stepDt = 1 / C.TICK;
+    while (W.accumulator >= stepDt) {
+      W.accumulator -= stepDt;
+      W.tick++;
+      W.dayTime += stepDt * 1000 * W.speed;
+      simStep();
+    }
+  }
+
+  render();
+  requestAnimationFrame(loop);
+}
+
+requestAnimationFrame(loop);
+</script>
+</body>
+</html>
